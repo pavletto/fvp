@@ -17,6 +17,10 @@
 ///    The identifier after :// is an arbitrary label string.
 /// 2. Set player state to playing and start feeding data via appendBuffer().
 /// 3. When all data has been fed, signal end-of-stream with flags: 1.
+///
+/// For real-time / live H.264 streams (Annex-B byte-stream format) with the
+/// lowest possible end-to-end latency, see realtime_h264_example.dart which
+/// also documents the recommended player configuration for that use-case.
 
 import 'dart:async';
 import 'dart:io';
