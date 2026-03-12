@@ -511,6 +511,47 @@ class Player {
     return ret;
   }
 
+  /// Feed raw [data] bytes to the player when using the `mdkbuf://` protocol.
+  ///
+  /// Set [media] to `'mdkbuf://identifier'` (any string after `://`) to enable
+  /// buffer-based playback. Then call this method to push data chunks into the
+  /// player's internal buffer.
+  ///
+  /// [flags] values:
+  /// - `0`: Normal data chunk; more data will follow.
+  /// - `1`: Final chunk; signals end of stream (no more data).
+  ///
+  /// Returns `true` if the data was accepted, `false` if the internal buffer is
+  /// full. When `false` is returned, retry the same chunk after a short delay.
+  ///
+  /// Example:
+  /// ```dart
+  /// player.media = 'mdkbuf://memory';
+  /// player.state = PlaybackState.playing;
+  /// // Feed data in chunks:
+  /// for (final chunk in chunks) {
+  ///   while (!player.appendBuffer(chunk)) {
+  ///     await Future.delayed(const Duration(milliseconds: 10));
+  ///   }
+  /// }
+  /// // Signal end of stream:
+  /// player.appendBuffer(Uint8List(0), flags: 1);
+  /// ```
+  bool appendBuffer(Uint8List data, {int flags = 0}) {
+    if (data.isEmpty) {
+      return _player.ref.appendBuffer.asFunction<
+          bool Function(Pointer<mdkPlayer>, Pointer<Uint8>, int, int)>()(
+          _player.ref.object, nullptr, 0, flags);
+    }
+    final ptr = calloc<Uint8>(data.length);
+    ptr.asTypedList(data.length).setAll(0, data);
+    final ret = _player.ref.appendBuffer.asFunction<
+        bool Function(Pointer<mdkPlayer>, Pointer<Uint8>, int, int)>()(
+        _player.ref.object, ptr, data.length, flags);
+    calloc.free(ptr);
+    return ret;
+  }
+
   /// Return buffered duration in milliseconds.
   /// https://github.com/wang-bin/mdk-sdk/wiki/Player-APIs#int64_t-bufferedint64_t-bytes--nullptr-const
   int buffered() {
