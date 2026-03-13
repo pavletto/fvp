@@ -28,16 +28,35 @@
 ///                                         │
 ///                                    Flutter Texture
 ///
+/// ─── KNOWN STALL POINTS ───────────────────────────────────────────────────
+/// There are several independent places in the pipeline that can stall a live
+/// Annex-B stream. The configuration below addresses all of them:
+///
+///   Stall source                     Setting that fixes it
+///   ─────────────────────────────────────────────────────────────────────────
+///   Container format auto-detection  avformat.f = h264
+///   Demuxer packet queue (GOP wait)  avformat.fflags = +nobuffer
+///   Format analysis window (5 s)     avformat.analyzeduration = 0
+///   FPS probing                      avformat.fpsprobesize = 0
+///   I/O thread packet queue          avformat.thread_queue_size = 1
+///   Decoder B-frame buffer (up to    avcodec.flags = +low_delay
+///     16 frames on software decode)
+///   Decoder frame threading latency  avcodec.thread_type = 2 (slice)
+///   A/V clock sync (video-only src)  setActiveTracks(audio, []) (videoOnly: true)
+///   prepare() hanging with no data   Use prepareWithTimeout() instead of prepare()
+///   Decode queue pre-roll            setBufferRange(min: 0, max: 500, drop: true)
+///
 /// ─── CONFIGURATION SUMMARY ────────────────────────────────────────────────
 /// 1. `avformat.f` = `h264`
 ///    Bypass format auto-detection and go straight to the H.264 byte-stream
 ///    demuxer. Eliminates the probing delay that would otherwise occur when
 ///    the player inspects the first bytes to decide the container format.
 ///
-/// 2. `avformat.fflags` = `+nobuffer`
+/// 2. `avformat.fflags` = `+nobuffer+discardcorrupt`
 ///    Disable AVFormat's internal input buffer. Every packet that arrives is
 ///    handed to the decoder immediately. Without this, FFmpeg may hold packets
 ///    until a full GOP is available, adding 1-2 key-frame intervals of delay.
+///    `+discardcorrupt` silently skips malformed NAL units rather than stalling.
 ///
 /// 3. `avformat.probesize` = `512`
 ///    Absolute minimum probe size (bytes). Since we specify the format
@@ -54,21 +73,53 @@
 ///    means the player starts decoding as soon as the very first full NAL unit
 ///    arrives.
 ///
-/// 6. `setBufferRange(min: 0, max: 500, drop: true)`
+/// 6. `avformat.thread_queue_size` = `1`
+///    Limits the demuxer I/O thread packet queue to 1 entry. Without this,
+///    old packets can pile up in the queue and re-introduce latency even when
+///    all other options are set correctly.
+///
+/// 7. `avcodec.flags` = `+low_delay`
+///    Tells the H.264 **decoder** not to buffer frames for B-frame reordering.
+///    Without this, the software (FFmpeg) decoder may buffer up to 16 frames
+///    (~533 ms at 30 fps) before outputting the first decoded frame. This is
+///    the single most impactful codec-level option for live H.264 latency.
+///    Note: hardware decoders (VideoToolbox, MediaCodec, D3D11) inherently have
+///    low-delay behaviour; this flag mainly benefits the FFmpeg fallback.
+///
+/// 8. `avcodec.thread_type` = `2` (slice)
+///    Frame-level threading (the default, type=1) spawns a thread per frame
+///    and the decoder outputs frame N while thread N+1 is still decoding, which
+///    adds one full frame of extra output latency. Slice-level threading (type=2)
+///    parallelises work within a single frame, with no additional output delay.
+///
+/// 9. `setBufferRange(min: 0, max: 500, drop: true)`
 ///    • `min: 0` — do not wait for any pre-roll before starting to decode.
 ///    • `max: 500` — cap the decode queue at 500 ms. If the source is faster
 ///      than real-time the oldest unrendered frames are dropped so the viewer
 ///      always sees the freshest frame.
 ///    • `drop: true` — enable the frame-drop behaviour described above.
 ///
-/// 7. Hardware decoder priority list
+/// 10. Hardware decoder priority list
 ///    Lets the player pick the fastest available HW decoder. FFmpeg is kept as
 ///    the last-resort software fallback so the stream always plays.
 ///    Platform-specific names:
 ///      Windows  → D3D11 (preferred), NVDEC, CUVID, DXVA2
 ///      macOS/iOS→ VideoToolbox
-///      Linux    → VAAPI, VDPAU, V4L2
+///      Linux    → VAAPI, VDPAU, V4L2M2M
 ///      Android  → MediaCodec
+///
+/// ─── A/V SYNC STALL (VIDEO-ONLY STREAMS) ─────────────────────────────────
+/// MDK uses the audio clock as the master clock by default. If your source is
+/// video-only (no audio track), the player can stall waiting for audio data
+/// that never arrives. Pass `videoOnly: true` to [configureForRealtimeH264]
+/// to explicitly disable audio track selection and avoid this stall.
+///
+/// ─── prepare() HANG ───────────────────────────────────────────────────────
+/// [mdk.Player.prepare] has **no built-in timeout**. If the demuxer never
+/// receives enough data to initialise (e.g. because data feeding started too
+/// late, or the source stalled before the first SPS/PPS NAL unit), the Dart
+/// Future returned by `prepare()` will never complete.
+/// Use [prepareWithTimeout] instead of calling `prepare()` directly.
 
 import 'dart:async';
 import 'dart:io';
@@ -123,16 +174,23 @@ List<String> _platformDecoderList() {
 /// streaming to [player].
 ///
 /// Call this **before** setting [mdk.Player.media] and before
-/// [mdk.Player.prepare].
+/// [prepareWithTimeout] / [mdk.Player.prepare].
 ///
-/// The optional [maxBufferMs] parameter controls how many milliseconds of
-/// decoded frames may accumulate before old frames are dropped. The default
-/// value of `500` ms is a good balance between smoothness and latency;
-/// lower it (e.g. `200`) for tighter real-time requirements at the cost of
-/// more frequent frame drops.
+/// Parameters:
+///
+/// - [maxBufferMs] — how many milliseconds of decoded frames may accumulate
+///   before old frames are dropped. Default 500 ms; lower it (e.g. 200) for
+///   tighter real-time requirements at the cost of more frequent frame drops.
+///
+/// - [videoOnly] — set to `true` when the Annex-B stream contains **no audio
+///   track**. MDK uses the audio clock as the master clock by default; if no
+///   audio data arrives, the player can stall indefinitely waiting for an audio
+///   packet to advance the clock. Passing `videoOnly: true` disables audio
+///   track selection so the player uses the video clock instead.
 void configureForRealtimeH264(
   mdk.Player player, {
   int maxBufferMs = 500,
+  bool videoOnly = false,
 }) {
   // ── 1. Demuxer: bypass format detection, go straight to H.264 parser ──
   // Tells FFmpeg to treat the stream as a raw H.264 Annex-B byte stream.
@@ -159,17 +217,74 @@ void configureForRealtimeH264(
   // Start decoding as soon as the first complete NAL unit arrives.
   player.setProperty('avformat.analyzeduration', '0');
 
-  // ── 6. Decode queue: no pre-roll, aggressive frame drop ──────────────
+  // ── 6. Demuxer I/O thread: limit packet queue to 1 entry ─────────────
+  // Without this, old packets accumulate in the queue and re-introduce
+  // latency. Keeping the queue at 1 ensures we always process the newest
+  // packet, not one that has been waiting in line.
+  player.setProperty('avformat.thread_queue_size', '1');
+
+  // ── 7. Decoder: force low-delay mode ─────────────────────────────────
+  // Tells the H.264 decoder not to buffer frames for B-frame reordering.
+  // Without this, the software (FFmpeg) decoder can hold up to 16 frames
+  // (~533 ms at 30 fps) before releasing even the first one.
+  // Hardware decoders (VideoToolbox, MediaCodec, D3D11) already have
+  // inherent low-delay behaviour; this flag primarily benefits the FFmpeg
+  // software fallback.
+  player.setProperty('avcodec.flags', '+low_delay');
+
+  // ── 8. Decoder: use slice threading, not frame threading ─────────────
+  // Frame-level threading (the H.264 default) outputs frame N while a
+  // thread is still decoding frame N+1, adding one full frame of output
+  // latency. Slice threading (type=2) parallelises within a single frame
+  // and does not increase output delay.
+  player.setProperty('avcodec.thread_type', '2');
+
+  // ── 9. Decode queue: no pre-roll, aggressive frame drop ──────────────
   // • min: 0  — start playback immediately, no pre-buffering.
   // • max: maxBufferMs — oldest frames beyond this window are dropped so
   //   the viewer always sees the freshest content.
   // • drop: true — enable the drop behaviour.
   player.setBufferRange(min: 0, max: maxBufferMs, drop: true);
 
-  // ── 7. Hardware decoder priority ─────────────────────────────────────
+  // ── 10. A/V sync: disable audio for video-only sources ───────────────
+  // MDK uses the audio clock as the master clock. If the source has no
+  // audio, the player will stall waiting for audio data that never arrives.
+  // Passing videoOnly:true disables audio track selection so the player
+  // uses the system clock instead.
+  if (videoOnly) {
+    player.setActiveTracks(mdk.MediaType.audio, []);
+  }
+
+  // ── 11. Hardware decoder priority ────────────────────────────────────
   // The player tries each entry in order; the first one that can handle
   // the stream wins. FFmpeg is the guaranteed-available software fallback.
   player.videoDecoders = _platformDecoderList();
+}
+
+// ---------------------------------------------------------------------------
+// Utility: prepare() with a timeout
+// ---------------------------------------------------------------------------
+
+/// Calls [mdk.Player.prepare] and returns a negative error code if [player]
+/// has not produced its first frame within [timeout].
+///
+/// **Background:** [mdk.Player.prepare] returns a Dart `Future` that completes
+/// only when the native layer has decoded at least one frame. If the demuxer
+/// never receives enough data to initialise (e.g. because data feeding started
+/// too late, or the source stalled before the first SPS/PPS NAL unit),
+/// `prepare()` will **never** complete — blocking your `async` code forever.
+///
+/// [prepareWithTimeout] wraps `prepare()` with `Future.timeout` so callers
+/// always get a result. On timeout the function returns `-99`.
+///
+/// Recommended timeout for a live Annex-B stream: 5–10 seconds. A shorter
+/// value (e.g. 3 s) is acceptable when you know SPS/PPS arrive in the first
+/// packet; a longer value is safer when network conditions are unpredictable.
+Future<int> prepareWithTimeout(
+  mdk.Player player, {
+  Duration timeout = const Duration(seconds: 10),
+}) {
+  return player.prepare().timeout(timeout, onTimeout: () => -99);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +324,9 @@ class _RealtimeH264ExampleState extends State<RealtimeH264Example> {
     setState(() => _status = 'Configuring player…');
 
     // ── Step 1: apply low-latency H.264 settings ──────────────────────
-    configureForRealtimeH264(_player, maxBufferMs: 500);
+    // videoOnly: true because our sample source has no audio track.
+    // Remove this flag if your live stream carries audio.
+    configureForRealtimeH264(_player, maxBufferMs: 500, videoOnly: true);
 
     // ── Step 2: select the mdkbuf:// source ───────────────────────────
     // The identifier after "://" is arbitrary; it is only used as a label
@@ -228,11 +345,16 @@ class _RealtimeH264ExampleState extends State<RealtimeH264Example> {
     //   _mySocket.listen((bytes) => _feedChunk(bytes));
     final feedFuture = _simulateRealtimeSource();
 
-    // ── Step 5: wait for the first frame ──────────────────────────────
-    final pos = await _player.prepare();
+    // ── Step 5: wait for the first frame (with timeout) ───────────────
+    // prepareWithTimeout() prevents an indefinite hang if the demuxer
+    // never receives enough data (e.g. source stalls before first SPS/PPS).
+    // Code -99 means the timeout was hit; any other negative code is an
+    // internal error from the native layer.
+    final pos = await prepareWithTimeout(_player, timeout: const Duration(seconds: 10));
     if (pos < 0) {
       if (mounted) {
-        setState(() => _status = 'Failed to prepare (code: $pos)');
+        final reason = pos == -99 ? 'timeout' : 'error code $pos';
+        setState(() => _status = 'Failed to prepare ($reason)');
       }
       return;
     }
@@ -401,8 +523,12 @@ class _RealtimeH264ExampleState extends State<RealtimeH264Example> {
                     const _SettingRow('avformat.probesize', '512'),
                     const _SettingRow('avformat.fpsprobesize', '0'),
                     const _SettingRow('avformat.analyzeduration', '0'),
+                    const _SettingRow('avformat.thread_queue_size', '1'),
+                    const _SettingRow('avcodec.flags', '+low_delay'),
+                    const _SettingRow('avcodec.thread_type', '2 (slice)'),
                     const _SettingRow(
                         'setBufferRange', 'min=0  max=500ms  drop=true'),
+                    const _SettingRow('audio tracks', 'disabled (videoOnly)'),
                     _SettingRow('videoDecoders',
                         _platformDecoders().join(' › ')),
                   ],
